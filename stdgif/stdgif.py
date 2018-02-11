@@ -49,18 +49,17 @@
 from __future__ import print_function
 
 import argparse
+import itertools
 import math
 import os
 import sys
-import tempfile
 import time
 
 import requests
 
-from PIL import Image
+from PIL import Image, ImageSequence
 
-
-FRAMES = {}
+FRAMES = []
 
 BITMAPS = {
     0x00000000: ' ',
@@ -99,16 +98,16 @@ BITMAPS = {
     0x666ff666: u'\u254b',  # Heavy cross
 
     0x000cc000: u'\u2578',  # Bold horizontal left
-    0x00066000: u'\u2579',  # Bold horizontal up
+    # 0x00066000: u'\u2579',  # Bold horizontal up
     0x00033000: u'\u257a',  # Bold horizontal right
-    0x00066000: u'\u257b',  # Bold horizontal down
+    # 0x00066000: u'\u257b',  # Bold horizontal down
 
     0x06600660: u'\u254f',  # Heavy double dash vertical
 
     0x000f0000: u'\u2500',  # Light horizontal
     0x0000f000: u'\u2500',
-    0x44444444: u'\u2502',  # Light vertical
-    0x22222222: u'\u2502',
+    # 0x44444444: u'\u2502',  # Light vertical
+    # 0x22222222: u'\u2502',
 
     0x000e0000: u'\u2574',  # light left
     0x0000e000: u'\u2574',  # light left
@@ -157,13 +156,13 @@ def make_char(c, fg, bg):
         return '\x1b[0m '
 
     return '{}{}{}'.format(
-            esc(38, 2, fg[0], fg[1], fg[2]),
-            esc(48, 2, bg[0], bg[1], bg[2]),
-            c.encode('utf-8'))
+        esc(38, 2, fg[0], fg[1], fg[2]),
+        esc(48, 2, bg[0], bg[1], bg[2]),
+        c.encode('utf-8'))
 
 
 def make_percent(num, den):
-    """Make a numberator and a denominator into a percentage."""
+    """Make a numerator and a denominator into a percentage."""
     return math.floor(100.0 * (float(num) / max(den, 1)))
 
 
@@ -242,7 +241,7 @@ def handle_pixel(img, x, y):
     if best_diff > 10:
         inverted = False
         character = u' \u2591\u2592\u2593\u2588'[
-                min(4, len(fg_color) * 5 / 32)]
+            min(4, len(fg_color) * 5 / 32)]
 
     if inverted:
         tmp = avg_bg_rgb
@@ -256,24 +255,28 @@ def frame_to_ansi(frame):
     """Convert an image into 4x8 chunks and return ansi."""
     w, h = frame.size
 
-    buf = '\x1b[0m'
-    for y in range(0, h, 8):
-        for x in range(0, w, 4):
-            buf += handle_pixel(frame, x, y)
+    lines = (
+        ''.join(
+            (handle_pixel(frame, x, y) for x in range(0, w, 4))
+        ) for y in range(0, h, 8)
+    )
+    ansi = ''.join(
+        ('\x1b[0m', '\n'.join(lines))
+    )
 
-        buf += '\n'
-
-    return buf
+    return ansi
 
 
-def die(out=sys.stdout, gif=None):
-    """Unbork the terminal."""
-    if gif:
-        os.remove(gif)
-    if out.name != '<stdout>':
-        print('printf ', file=out, end='')
-    print('\x1b[34h\x1b[?25h\x1b[0m\x1b[0m', file=out)
-    sys.exit(0)
+class RestoredTerminal(object):
+    """Context manager to ensure we unbork the terminal."""
+
+    def __enter__(self):
+        pass
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not os.isatty(sys.stdout):
+            print('printf ', end='')
+        print('\x1b[34h\x1b[?25h\x1b[0m\x1b[0m')
 
 
 def is_url(img):
@@ -282,17 +285,17 @@ def is_url(img):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(epilog='Redirect this script\'s output to '
+                                        'produce a bash script that '
+                                        'plays the gif - suitable for '
+                                        'sourcing from your .bashrc')
 
     ap.add_argument('-w', '--width', type=int,
                     help='Width of file to show', default=80)
     ap.add_argument('-f', '--forever', action='store_true',
                     help='Loop forever')
     ap.add_argument('-d', '--delay', type=float, default=0.1,
-                    help='The delay between images that make up a gif')
-    ap.add_argument('-o', '--output', type=argparse.FileType('wb', 0),
-                    help='Generated bash script path - suitable for sourcing '
-                         'from your .bashrc', default=sys.stdout)
+                    help='The delay between frames of a gif')
     ap.add_argument('-s', '--seperator', type=str, default=None,
                     help='Print the seperator between frames of a gif '
                          '(this can be useful if piping output into '
@@ -303,17 +306,10 @@ def main():
 
     img = args.img
 
-    gif_path = None
     if is_url(img):
         r = requests.get(img, stream=True)
         r.raise_for_status()
-
-        gif = tempfile.NamedTemporaryFile(prefix='gifup-', delete=False)
-        gif_path = gif.name
-        with open(gif_path, 'w') as f:
-            f.write(r.raw.read())
-
-        img = gif.name
+        img = r.raw
 
     img = Image.open(img)
     img.load()
@@ -323,85 +319,51 @@ def main():
     h = oh * w / ow
     size = (w, h)
 
-    offset = 0
-    frames_filled = False
-    total_frames = 0
+    total_frames = len([frame for frame in ImageSequence.Iterator(img)])
 
-    while True:
-        try:
-            img.seek(offset)
+    for offset, frame in enumerate(ImageSequence.Iterator(img)):
 
-            if not frames_filled:
-                total_frames += 1
-                offset += 1
-                continue
+        new_frame = Image.new('RGBA', frame.size)
+        new_frame.paste(img, (0, 0), frame.convert('RGBA'))
+        new_frame = new_frame.resize(size)
 
-            frame = Image.new('RGBA', img.size)
-            frame.paste(img, (0, 0), img.convert('RGBA'))
-            frame = frame.resize(size)
-
-            fmt = '\rLoading frames: {:.2f}% ({} of {})'
-            print(fmt.format(make_percent(offset, total_frames),
-                             offset, total_frames),
-                  file=sys.stderr,
-                  end='')
-            if not FRAMES.get(offset):
-                FRAMES[offset] = frame_to_ansi(frame)
-
-            offset += 1
-        except EOFError:
-            if not frames_filled:
-                frames_filled = True
-                offset = 0
-
-                continue
-            break
-        except KeyboardInterrupt:
-            die(out=args.output, gif=gif_path)
-
-    offset = 0
+        fmt = '\rLoading frames: {:.2f}% ({} of {})'
+        print(fmt.format(make_percent(offset, total_frames),
+                         offset, total_frames),
+              file=sys.stderr,
+              end='')
+        FRAMES.append(frame_to_ansi(new_frame))
 
     # Clear the \r from sys.stderr
     print('', file=sys.stderr)
 
-    # If we're not writing to stdout, we're generating a bash script
-    if args.output.name != '<stdout>':
-        print('#!/usr/bin/env bash', file=args.output)
+    # If we're not writing to a terminal, we're generating a bash script
+    if not os.isatty(sys.stdout):
+        print('#!/usr/bin/env bash')
 
-    while True:
+        for offset, frame in enumerate(FRAMES):
+            print('cat <<FILE{offset}\n'
+                  '\r\x1b[{h}A{frame}{sep}\n'
+                  'FILE{offset}\n'
+                  'sleep {delay}\n'
+                  ''.format(h=h, frame=frame, sep=args.seperator or '', offset=offset, delay=args.delay), end='')
+
+        print('printf \x1b[H\x1b[J')
+
+    else:
+        if args.forever:
+            frames = itertools.cycle(FRAMES)
+        else:
+            frames = FRAMES
+
         try:
-            if args.output.name != '<stdout>':
-                print('cat <<FILE{}'.format(offset), file=args.output)
-
-            print('\r\x1b[{}A'.format(h), end='', file=args.output)
-            print(FRAMES[offset], end='', file=args.output)
-            if args.seperator:
-                print(args.seperator, file=args.output)
-
-            if args.output.name != '<stdout>':
-                print('FILE{}'.format(offset), file=args.output)
-
-            if args.output.name == '<stdout>':
-                time.sleep(args.delay)
-            else:
-                print('sleep {}'.format(args.delay), file=args.output)
-
-            offset += 1
-        except KeyError:
-            if args.forever and args.output.name == '<stdout>':
-                offset = 0
-                continue
-
-            if args.output.name != '<stdout>':
-                print('\nFILE{}\n'.format(offset), file=args.output)
-                print('printf \x1b[H\x1b[J', file=args.output)
-
-            break
+            with RestoredTerminal():
+                for frame in frames:
+                    print('\r\x1b[{h}A{frame}{sep}'.format(h=h, frame=frame, sep=args.seperator or ''), end='')
+                    time.sleep(args.delay)
 
         except KeyboardInterrupt:
-            break
-
-    die(out=args.output, gif=gif_path)
+            sys.exit(128)
 
 
 if __name__ == '__main__':
