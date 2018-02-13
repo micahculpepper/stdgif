@@ -175,14 +175,92 @@ def make_char(c, fg, bg):
         c.encode('utf-8')
     ))
 
-
 def make_percent(num, den):
     """Make a numerator and a denominator into a percentage."""
     return math.floor(100.0 * (float(num) / max(den, 1)))
 
 
+PIXELARGS = []
+
+
+def new_handle_pixel(img, x, y):
+    """Turn a 4x8 dict of rgb tuples into a single-ansi char."""
+    PIXELARGS.append((img, x, y))
+
+    w, h = img.size
+    x_offset = min(x + 4, w)
+    y_offset = min(y + 8, h)
+    box = (x, y, x_offset, y_offset)
+    sub_img = img.crop(box)
+
+    channels = {
+        "R": {
+            "vals": list(sub_img.getchannel("R").getdata())
+        },
+        "G": {
+            "vals": list(sub_img.getchannel("G").getdata())
+        },
+        "B": {
+            "vals": list(sub_img.getchannel("B").getdata())
+        }
+    }
+
+    num_pixels = len(channels["R"]["vals"])
+
+    for chan in channels:
+        channels[chan]["max"] = max(channels[chan]["vals"])
+        channels[chan]["min"] = min(channels[chan]["vals"])
+        channels[chan]["split"] = channels[chan]["max"] - channels[chan]["min"]
+
+    split_chan = max(channels, key=lambda x: channels[x]["split"])
+    split_val = channels[split_chan]["min"] + channels[split_chan]["split"] / 2
+
+    bg_color = []
+    fg_color = []
+    for r, g, b, i in zip(*(channels[chan]["vals"] for chan in ("R", "G", "B", split_chan))):
+        if (i & 255) > split_val:
+            fg_color.append((r, g, b))
+        else:
+            bg_color.append((r, g, b))
+
+    bits = 2 ** (len(fg_color) or 1 - 1)
+
+    avg_bg_rgb = [sum(color) / len(color) for color in zip(*bg_color)] or [0, 0, 0]
+    avg_fg_rgb = [sum(color) / len(color) for color in zip(*fg_color)] or [0, 0, 0]
+
+    best_diff = sys.maxint
+    inverted = False
+    for bitmap in list(BITMAPS.keys()):
+        xor = bin(bitmap ^ bits)
+        diff = xor.count('1')
+        if diff < best_diff:
+            character = BITMAPS[bitmap]
+            best_diff = diff
+            inverted = False
+
+        # make sure to & the ~ with 0xffffffff to fill up all 32 bits
+        not_xor = bin((~bitmap & 0xffffffff) ^ bits)
+        diff = not_xor.count('1')
+        if diff < best_diff:
+            character = BITMAPS[bitmap]
+            best_diff = diff
+            inverted = True
+
+    if best_diff > 10:
+        inverted = False
+        character = u' \u2591\u2592\u2593\u2588'[
+            min(4, len(fg_color) * 5 / 32)]
+
+    if inverted:
+        tmp = avg_bg_rgb
+        avg_bg_rgb = avg_fg_rgb
+        avg_fg_rgb = tmp
+
+    return make_char(character, avg_fg_rgb, avg_bg_rgb)
+
 def handle_pixel(img, x, y):
     """Turn a 4x8 dict of rgb tuples into a single-ansi char."""
+    PIXELARGS.append((img, x, y))
     w, h = img.size
     x_offset = min(x + 4, w)
     y_offset = min(y + 8, h)
