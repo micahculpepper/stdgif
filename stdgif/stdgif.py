@@ -50,6 +50,7 @@ from __future__ import print_function
 
 import argparse
 from fractions import Fraction
+import io
 import itertools
 import math
 import os
@@ -205,7 +206,9 @@ def new_handle_pixel(img, x, y):
         }
     }
 
-    num_pixels = len(channels["R"]["vals"])
+    # max(itertools.takewhile(lambda x: x != 255, [1,2,3,2,6,7]))
+
+    # num_pixels = len(channels["R"]["vals"])
 
     for chan in channels:
         channels[chan]["max"] = max(channels[chan]["vals"])
@@ -223,7 +226,7 @@ def new_handle_pixel(img, x, y):
         else:
             bg_color.append((r, g, b))
 
-    bits = 2 ** (len(fg_color) or 1 - 1)
+    bits = 2 ** len(fg_color)
 
     avg_bg_rgb = [sum(color) / len(color) for color in zip(*bg_color)] or [0, 0, 0]
     avg_fg_rgb = [sum(color) / len(color) for color in zip(*fg_color)] or [0, 0, 0]
@@ -428,7 +431,7 @@ def main():
         default=col
     )
     ap.add_argument(
-        '-h', '--height', type=int, help='max height of file to show',
+        '-l', '--length', type=int, help='max length of file to show',
         default=lines
     )
     ap.add_argument(
@@ -451,14 +454,14 @@ def main():
     if is_url(args.img):
         with requests.get(args.img, stream=True) as r:
             r.raise_for_status()
-            img = Image.open(r.raw)
+            img = Image.open(io.BytesIO(r.raw.read()))
     else:
         with open(args.img) as f:
-            img = Image.open(f)
+            img = Image.open(io.BytesIO(f.read()))
 
     # img.load()
 
-    new_size = calculate_borders(args.w, args.h, *img.size)
+    new_size = calculate_borders(args.width, args.length, *img.size)
     total_frames = len([frame for frame in ImageSequence.Iterator(img)])
     frames = []
     for offset, frame in enumerate(ImageSequence.Iterator(img)):
