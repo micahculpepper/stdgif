@@ -49,17 +49,27 @@
 from __future__ import print_function
 
 import argparse
+from fractions import Fraction
 import itertools
 import math
 import os
+import subprocess
 import sys
 import time
+
+try:
+    # Python 3 feature
+    from shutil import get_terminal_size
+except ImportError:
+    # Backported Python 2 version
+    try:
+        from backports.shutil_get_terminal_size import get_terminal_size
+    except ImportError:
+        get_terminal_size = None
 
 import requests
 
 from PIL import Image, ImageSequence
-
-FRAMES = []
 
 BITMAPS = {
     0x00000000: ' ',
@@ -137,7 +147,11 @@ BITMAPS = {
 
 def esc(*args):
     """Escape ansi codes."""
-    return '\x1b[%sm' % ';'.join(str(arg) for arg in args)
+    return ''.join((
+        '\x1b[',
+        ';'.join(str(arg) for arg in args),
+        'sm'
+    ))
 
 
 def clamp(val, small, large):
@@ -155,10 +169,11 @@ def make_char(c, fg, bg):
     if fg[0] == fg[1] == fg[2] == bg[0] == bg[1] == bg[2] == 0:
         return '\x1b[0m '
 
-    return '{}{}{}'.format(
+    return ''.join((
         esc(38, 2, fg[0], fg[1], fg[2]),
         esc(48, 2, bg[0], bg[1], bg[2]),
-        c.encode('utf-8'))
+        c.encode('utf-8')
+    ))
 
 
 def make_percent(num, den):
@@ -274,8 +289,6 @@ class RestoredTerminal(object):
         pass
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not os.isatty(sys.stdout):
-            print('printf ', end='')
         print('\x1b[34h\x1b[?25h\x1b[0m\x1b[0m')
 
 
@@ -284,86 +297,136 @@ def is_url(img):
     return img.startswith('http://') or img.startswith('https://')
 
 
+def find_term_size():
+    """Detect the size of the terminal we are running in.
+
+    :return (int, int): columns, lines
+    """
+    col = 80
+    lines = 24
+    if get_terminal_size is not None:
+        col, lines = get_terminal_size()
+    else:
+        try:
+            col, lines = [
+                int(i) for i in
+                subprocess.check_output(["stty", "size"]).split()
+            ]
+        except Exception:
+            pass
+    return col, lines
+
+
+def calculate_borders(bounding_width, bounding_height, original_width, original_height):
+    """Calculate new dimensions that preserve the original aspect ratio and fit
+    within the bounds given.
+
+    :return (int, int): width, height
+    """
+    original_ratio = Fraction(original_width, original_height)
+    bounding_ratio = Fraction(bounding_width, bounding_height)
+
+    if original_ratio > bounding_ratio:
+        new_height = Fraction(bounding_width, original_ratio)
+        new_width = new_height * original_ratio
+    else:
+        new_width = bounding_height * original_ratio
+        new_height = Fraction(original_height, original_width) * new_width
+
+    new_width = min(int(round(new_width)), bounding_width)
+    new_height = min(int(round(new_height)), bounding_height)
+
+    return new_width, new_height
+
+
 def main():
-    ap = argparse.ArgumentParser(epilog='Redirect this script\'s output to '
-                                        'produce a bash script that '
-                                        'plays the gif - suitable for '
-                                        'sourcing from your .bashrc')
-
-    ap.add_argument('-w', '--width', type=int,
-                    help='Width of file to show', default=80)
-    ap.add_argument('-f', '--forever', action='store_true',
-                    help='Loop forever')
-    ap.add_argument('-d', '--delay', type=float, default=0.1,
-                    help='The delay between frames of a gif')
-    ap.add_argument('-s', '--seperator', type=str, default=None,
-                    help='Print the seperator between frames of a gif '
-                         '(this can be useful if piping output into '
-                         'another file or program)')
-
-    ap.add_argument('img', type=str, help='File to show')
+    col, lines = find_term_size()
+    ap = argparse.ArgumentParser(
+        epilog='Redirect this script\'s output to produce a bash script that '
+        'plays the gif - suitable for sourcing from your .bashrc'
+    )
+    ap.add_argument(
+        '-w', '--width', type=int, help='max width of file to show',
+        default=col
+    )
+    ap.add_argument(
+        '-h', '--height', type=int, help='max height of file to show',
+        default=lines
+    )
+    ap.add_argument(
+        '-f', '--forever', action='store_true', help='Loop forever'
+    )
+    ap.add_argument(
+        '-d', '--delay', type=float, default=0.1,
+        help='The delay between frames of a gif'
+    )
+    ap.add_argument(
+        '-s', '--seperator', type=str,
+        help='Print the seperator between frames of a gif (this can be useful '
+             'if piping output into another file or program)'
+    )
+    ap.add_argument(
+        'img', type=str, help='File or url to show'
+    )
     args = ap.parse_args()
 
-    img = args.img
+    if is_url(args.img):
+        with requests.get(args.img, stream=True) as r:
+            r.raise_for_status()
+            img = Image.open(r.raw)
+    else:
+        with open(args.img) as f:
+            img = Image.open(f)
 
-    if is_url(img):
-        r = requests.get(img, stream=True)
-        r.raise_for_status()
-        img = r.raw
+    # img.load()
 
-    img = Image.open(img)
-    img.load()
-
-    w = args.width * 4
-    ow, oh = img.size
-    h = oh * w / ow
-    size = (w, h)
-
+    new_size = calculate_borders(args.w, args.h, *img.size)
     total_frames = len([frame for frame in ImageSequence.Iterator(img)])
-
+    frames = []
     for offset, frame in enumerate(ImageSequence.Iterator(img)):
-
+        print(
+            '\rLoading frames: {:.2f}% ({} of {})'
+            ''.format(make_percent(offset, total_frames), offset, total_frames),
+            file=sys.stderr, end=''
+        )
         new_frame = Image.new('RGBA', frame.size)
         new_frame.paste(img, (0, 0), frame.convert('RGBA'))
-        new_frame = new_frame.resize(size)
+        new_frame = new_frame.resize(new_size)
+        frames.append(frame_to_ansi(new_frame))
+    print('', file=sys.stderr)  # Clear the progress meter from stderr
 
-        fmt = '\rLoading frames: {:.2f}% ({} of {})'
-        print(fmt.format(make_percent(offset, total_frames),
-                         offset, total_frames),
-              file=sys.stderr,
-              end='')
-        FRAMES.append(frame_to_ansi(new_frame))
-
-    # Clear the \r from sys.stderr
-    print('', file=sys.stderr)
-
-    # If we're not writing to a terminal, we're generating a bash script
-    if not os.isatty(sys.stdout):
-        print('#!/usr/bin/env bash')
-
-        for offset, frame in enumerate(FRAMES):
-            print('cat <<FILE{offset}\n'
-                  '\r\x1b[{h}A{frame}{sep}\n'
-                  'FILE{offset}\n'
-                  'sleep {delay}\n'
-                  ''.format(h=h, frame=frame, sep=args.seperator or '', offset=offset, delay=args.delay), end='')
-
-        print('printf \x1b[H\x1b[J')
-
-    else:
+    if os.isatty(sys.stdout.fileno()):
         if args.forever:
-            frames = itertools.cycle(FRAMES)
-        else:
-            frames = FRAMES
-
+            frames = itertools.cycle(frames)
         try:
             with RestoredTerminal():
                 for frame in frames:
-                    print('\r\x1b[{h}A{frame}{sep}'.format(h=h, frame=frame, sep=args.seperator or ''), end='')
+                    print(
+                        '\r\x1b[{h}A{frame}{sep}'
+                        ''.format(
+                            h=new_size[1], frame=frame, sep=args.seperator
+                        ),
+                        end=''
+                    )
                     time.sleep(args.delay)
-
         except KeyboardInterrupt:
             sys.exit(128)
+    else:
+        # If we're not writing to a terminal, we're generating a bash script
+        print('#!/usr/bin/env bash')
+        for offset, frame in enumerate(frames):
+            print(
+                'cat <<FILE{offset}\n'
+                '\r\x1b[{h}A{frame}{sep}\n'
+                'FILE{offset}\n'
+                'sleep {delay}\n'
+                ''.format(
+                    h=new_size[1], frame=frame, sep=args.seperator,
+                    offset=offset, delay=args.delay
+                ),
+                end=''
+            )
+        print('printf \x1b[H\x1b[J')
 
 
 if __name__ == '__main__':
